@@ -1,0 +1,12 @@
+batch_size: 4
+learning_rate: 0.0001
+epochs: 20
+input_size: [480, 300]
+num_classes: 1
+model: unet
+dataset:
+  train_dir: './data/dataset_480_300/images'
+  mask_dir: './data/dataset_480_300/masks'
+  val_dir: './data/val_images'
+  val_mask_dir: './data/val_masks'
+save_dir: './experiments/run_1/checkpoints'
