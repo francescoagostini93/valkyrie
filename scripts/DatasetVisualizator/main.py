@@ -91,8 +91,11 @@ class DataVerificationTool:
             os.makedirs(os.path.join(self.quarantine_folder, 'images'))
             os.makedirs(os.path.join(self.quarantine_folder, 'masks'))
 
-        # Load image list
-        self.image_files = [f for f in os.listdir(self.images_folder) if f.endswith('.png')]
+        # Load image list — only include images that have a corresponding mask
+        self.image_files = [
+            f for f in os.listdir(self.images_folder)
+            if f.endswith('.png') and os.path.exists(os.path.join(self.masks_folder, f))
+        ]
         self.load_progress()
         self.update_progress()
         self.load_image()
