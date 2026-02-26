@@ -1,27 +1,27 @@
 """
 dual_pupil_net.py — Single-model coarse+fine pupil segmentation for RK3566 NPU (0.9 TOPS).
 
-Pipeline a regime (frame N ≥ 1):
-  1. CPU  downscale img_full[N] a 480×300                      → x_coarse   [~0.5ms]
-  2. CPU  per ogni pupilla i valida: crop img_full[N] da roi[i] → x_fine     [~0.1ms]
-           se pupilla i assente nell'ultimo frame: x_fine[i] = ultimo crop valido (o zeros)
+Steady-state pipeline (frame N ≥ 1):
+  1. CPU  downscale img_full[N] to 480×300                          → x_coarse   [~0.5ms]
+  2. CPU  for each valid pupil i: crop img_full[N] from roi[i]      → x_fine     [~0.1ms]
+           if pupil i absent in last frame: x_fine[i] = last valid crop (or zeros)
   3. NPU  rknn_run(x_coarse, x_fine)  → y_heatmap, y_conf, y_fine  [~10ms]
-  4. CPU  per ogni pupilla i:
+  4. CPU  for each pupil i:
            if sigmoid(y_conf[0,i]) > CONF_THR:
-               roi[i] = soft_argmax(y_heatmap[0,i]) * 16    ← aggiorna per frame N+1
-               mask_i  = sigmoid(y_fine[i]) > SEG_THR       ← maschera valida
+               roi[i] = soft_argmax(y_heatmap[0,i]) * 16    ← update for frame N+1
+               mask_i  = sigmoid(y_fine[i]) > SEG_THR       ← valid mask
            else:
-               roi[i] invariato (usa ultimo centro valido per crop del prossimo frame)
-               mask_i  = None / maschera invalida
+               roi[i] unchanged (use last valid centre for next frame crop)
+               mask_i  = None / invalid mask
 
 Frame 0 (init):
-  x_fine = zeros → rknn_run → usa y_heatmap/y_conf per inizializzare roi,
-                               ignora y_fine.
+  x_fine = zeros → rknn_run → use y_heatmap/y_conf to initialise roi,
+                               discard y_fine.
 
-Convenzione L/R:
-  Canale 0 = pupilla SINISTRA nel frame camera (= occhio DESTRO del paziente, OD).
-  Canale 1 = pupilla DESTRA  nel frame camera (= occhio SINISTRO del paziente, OS).
-  Le annotazioni del dataset devono rispettare questa convenzione.
+L/R Convention:
+  Channel 0 = LEFT pupil in the camera frame (= patient's RIGHT eye, OD).
+  Channel 1 = RIGHT pupil in the camera frame (= patient's LEFT eye, OS).
+  Dataset annotations must follow this convention.
 
 RKNN export:
   model.eval()
@@ -38,14 +38,14 @@ RKNN export:
   # rknn.build(do_quantization=True, dataset='calibration.txt')  # ~200 img
   # rknn.export_rknn('dual_pupil_net.rknn')
 
-Note RKNN:
-  - ReLU6 preferito a ReLU: range limitato → meno errore quantizzazione INT8.
-  - sigmoid NON inclusa negli output del modello: applica su CPU, oppure soglia 0 sui logit.
-  - F.interpolate(mode='bilinear') supportato da RKNN; se problemi → mode='nearest'.
-  - batch=2 del fine branch deve essere fisso a compile-time:
-    specificare input_size_list=[[1,1,300,480],[2,1,160,160]] nella config.
-  - y_conf ha shape [1,2,1,1] (Conv2d evita Reshape/Flatten problematici su NPU);
-    su CPU: conf = sigmoid(y_conf[0,:,0,0])  →  tensor([conf_L, conf_R]).
+RKNN notes:
+  - ReLU6 preferred over ReLU: limited range → less INT8 quantisation error.
+  - sigmoid NOT included in model outputs: apply on CPU, or threshold 0 on logits.
+  - F.interpolate(mode='bilinear') supported by RKNN; if issues → mode='nearest'.
+  - fine branch batch=2 must be fixed at compile-time:
+    specify input_size_list=[[1,1,300,480],[2,1,160,160]] in the config.
+  - y_conf has shape [1,2,1,1] (Conv2d avoids Reshape/Flatten which are problematic on NPU);
+    on CPU: conf = sigmoid(y_conf[0,:,0,0])  →  tensor([conf_L, conf_R]).
 """
 
 import math
@@ -59,8 +59,8 @@ import torch.nn.functional as F
 class GhostModule(nn.Module):
     """
     Ghost module (Han et al., GhostNet CVPR 2020).
-    Genera out_ch feature con ~50% del costo di una conv standard:
-      metà canali via conv regolare (primary), metà via depthwise cheap op.
+    Generates out_ch features at ~50% of the cost of a standard conv:
+      half channels via regular conv (primary), half via depthwise cheap op.
     """
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, ratio: int = 2):
         super().__init__()
@@ -84,7 +84,7 @@ class GhostModule(nn.Module):
 
 
 class DoubleGhost(nn.Module):
-    """Due GhostModule in sequenza."""
+    """Two GhostModules in sequence."""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.block = nn.Sequential(
@@ -97,7 +97,7 @@ class DoubleGhost(nn.Module):
 
 
 class DoubleConv(nn.Module):
-    """Due conv 3×3 + BN + ReLU6."""
+    """Two 3×3 convolutions + BN + ReLU6."""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.block = nn.Sequential(
@@ -117,56 +117,56 @@ class DoubleConv(nn.Module):
 
 class CoarseBranch(nn.Module):
     """
-    Encoder-only per localizzazione pupille su immagine 1/4 scala.
+    Encoder-only branch for pupil localisation on a 1/4 scale image.
 
     Input : [1, 1, 300, 480]
-    Output: heatmap [1, 2, 75, 120]  — posizione pupille (logit)
-            conf    [1, 2,  1,  1]  — esistenza pupille (logit)
+    Output: heatmap [1, 2, 75, 120]  — pupil position (logit)
+            conf    [1, 2,  1,  1]  — pupil existence (logit)
 
-    Ogni pixel dell'heatmap corrisponde a un blocco 4×4 px nel 480×300
-    e a 16×16 px nel 1920×1200 originale.
+    Each heatmap pixel corresponds to a 4×4 px block in 480×300
+    and to 16×16 px in the original 1920×1200.
 
-    Architettura:
-      Conv2d(1→base_ch, 3×3, stride=2)  @ 300×480  → 150×240   ← stem leggero
+    Architecture:
+      Conv2d(1→base_ch, 3×3, stride=2)  @ 300×480  → 150×240   ← lightweight stem
       DoubleGhost(base_ch → base_ch*2)  @ 150×240
       MaxPool ────────────────────────────────────── 75×120
       DoubleGhost(base_ch*2 → base_ch*2) @ 75×120
         ├─ Conv1×1(base_ch*2 → 2)  @ 75×120 → heatmap  [1, 2, 75, 120]
         └─ AvgPool(75×120) → Conv1×1(base_ch*2 → 2)  → conf  [1, 2, 1, 1]
 
-    Con base_ch=16:
-      MACs stem:  1×16×9×150×240  =   5 M   (vs 197 M del DoubleGhost full-res)
+    With base_ch=16:
+      MACs stem:  1×16×9×150×240  =   5 M   (vs 197 M for full-res DoubleGhost)
       MACs enc1:  DoubleGhost     = 260 M
       MACs enc2:  DoubleGhost     =  86 M
-      Totale CoarseBranch ≈ 351 M  (-35% rispetto alla versione full-res)
+      Total CoarseBranch ≈ 351 M  (-35% vs full-res version)
 
-    Il compito coarse è trovare blob da ~25 px: una conv stride-2 + 2 Ghost stages
-    è ampiamente sufficiente; non servono feature a piena risoluzione.
+    The coarse task is to find ~25 px blobs: a stride-2 conv + 2 Ghost stages
+    is more than sufficient; full-resolution features are not needed.
 
     Training:
-      Heatmap — per ogni pupilla i:
-        PRESENTE: target = gaussiana σ≈2px centrata su (cx_full/16, cy_full/16).
-        ASSENTE:  target = mappa di zeri.
-        Loss: BCEWithLogitsLoss (usare pos_weight per bilanciare lo sfondo).
-      Conf — per ogni pupilla i:
-        PRESENTE: target = 1.  ASSENTE: target = 0.
+      Heatmap — for each pupil i:
+        PRESENT: target = Gaussian σ≈2px centred at (cx_full/16, cy_full/16).
+        ABSENT:  target = zero map.
+        Loss: BCEWithLogitsLoss (use pos_weight to balance background).
+      Conf — for each pupil i:
+        PRESENT: target = 1.  ABSENT: target = 0.
         Loss: BCEWithLogitsLoss.
 
     Inference:
       conf = torch.sigmoid(y_conf[0, :, 0, 0])         # [2]: conf_L, conf_R
       for i in {0, 1}:
-          if conf[i] > CONF_THR:                        # es. 0.5
-              c = soft_argmax_2d(y_heatmap[:, i:i+1])  # [1, 1, 2] normalizzato
+          if conf[i] > CONF_THR:                        # e.g. 0.5
+              c = soft_argmax_2d(y_heatmap[:, i:i+1])  # [1, 1, 2] normalised
               roi[i] = c[0, 0] * tensor([1920., 1200.]) # px in 1920×1200
 
-    Note: AvgPool2d con kernel fisso (75, 120) invece di AdaptiveAvgPool2d
-    per compatibilità garantita con tutti i backend RKNN-Toolkit2.
+    Note: AvgPool2d with fixed kernel (75, 120) instead of AdaptiveAvgPool2d
+    for guaranteed compatibility with all RKNN-Toolkit2 backends.
     """
 
     def __init__(self, base_ch: int = 16):
         super().__init__()
-        # Stride-2 stem: downsampling 300×480 → 150×240 con una singola conv.
-        # Evita il DoubleGhost a piena risoluzione (197M MACs → 5M MACs).
+        # Stride-2 stem: downsampling 300×480 → 150×240 with a single conv.
+        # Avoids full-resolution DoubleGhost (197M MACs → 5M MACs).
         self.stem = nn.Sequential(
             nn.Conv2d(1, base_ch, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(base_ch),
@@ -176,8 +176,8 @@ class CoarseBranch(nn.Module):
         self.enc1 = DoubleGhost(base_ch,      base_ch * 2)   # @ 150×240
         self.enc2 = DoubleGhost(base_ch * 2,  base_ch * 2)   # @  75×120
         self.heatmap_head = nn.Conv2d(base_ch * 2, 2, 1)
-        # AvgPool fisso sul bottleneck 75×120 → evita AdaptiveAvgPool non sempre
-        # accelerato su NPU; dopo pool la spatial dim è [1,1] → Conv2d come FC.
+        # Fixed AvgPool on the 75×120 bottleneck → avoids AdaptiveAvgPool which
+        # is not always accelerated on NPU; after pool spatial dim is [1,1] → Conv2d as FC.
         self.conf_pool = nn.AvgPool2d(kernel_size=(75, 120))
         self.conf_head = nn.Conv2d(base_ch * 2, 2, 1)
 
@@ -195,14 +195,14 @@ class CoarseBranch(nn.Module):
 
 class FineBranch(nn.Module):
     """
-    Small U-Net per segmentazione precisa su crop full-res.
+    Small U-Net for precise segmentation on full-res crops.
 
-    Input : [2, 1, 160, 160]  — batch di 2 pupille (idx 0=sx, idx 1=dx).
-                                 Pesi condivisi: equivalente a processarle separatamente
-                                 con la stessa rete, ma in un'unica operazione NPU.
-    Output: [2, 1, 160, 160]  — maschere binarie (logit, nessuna sigmoid).
+    Input : [2, 1, 160, 160]  — batch of 2 pupils (idx 0=left, idx 1=right).
+                                 Shared weights: equivalent to processing them separately
+                                 with the same network, but in a single NPU operation.
+    Output: [2, 1, 160, 160]  — binary masks (logit, no sigmoid).
 
-    Architettura U-Net con features=[16,32,64], bottleneck 128ch:
+    U-Net architecture with features=[16,32,64], 128ch bottleneck:
       Encoder:
         DoubleConv(1→16)   @ 160×160
         MaxPool             → 80×80
@@ -219,14 +219,14 @@ class FineBranch(nn.Module):
       Head: Conv1×1(16→1)
 
     use_ghost : bool
-        False (default) = DoubleConv standard, qualità massima.
-        True            = DoubleGhost (~35% meno MACs, ~1,200M vs 1,864M).
-                          Raccomandato se il framerate reale è insufficiente.
-        MACs stimati:
-          use_ghost=False → ~1,864 M  →  modello totale ~2,215 M
-          use_ghost=True  → ~1,200 M  →  modello totale ~1,551 M
+        False (default) = standard DoubleConv, maximum quality.
+        True            = DoubleGhost (~35% fewer MACs, ~1,200M vs 1,864M).
+                          Recommended if the actual framerate is insufficient.
+        Estimated MACs:
+          use_ghost=False → ~1,864 M  →  total model ~2,215 M
+          use_ghost=True  → ~1,200 M  →  total model ~1,551 M
 
-    RKNN: compilare con input_size_list [[2,1,160,160]].
+    RKNN: compile with input_size_list [[2,1,160,160]].
     """
 
     def __init__(self, features: list = None, use_ghost: bool = False):
@@ -249,7 +249,7 @@ class FineBranch(nn.Module):
         self.bottleneck = ConvBlock(features[-1], features[-1] * 2)
 
         for f in reversed(features):
-            # 1×1 conv: dimezza i canali prima del cat con lo skip
+            # 1×1 conv: halves channels before cat with the skip
             self.up_convs.append(nn.Conv2d(f * 2, f, 1, bias=False))
             self.dec_convs.append(ConvBlock(f * 2, f))
 
@@ -278,28 +278,28 @@ class FineBranch(nn.Module):
 
 class DualPupilNet(nn.Module):
     """
-    Modello unificato coarse+fine per segmentazione pupille IR.
-    Un solo modello RKNN caricato in NPU, chiamato con rknn_run() ad ogni frame.
+    Unified coarse+fine model for IR pupil segmentation.
+    A single RKNN model loaded in NPU, called with rknn_run() on every frame.
 
     ┌─ Inputs ────────────────────────────────────────────────────────────────┐
-    │ x_coarse  [1, 1, 300, 480]  immagine full downscalata 4× (grayscale)   │
-    │ x_fine    [2, 1, 160, 160]  crop full-res centrati sulle pupille        │
-    │                              idx 0 = pupilla sx, idx 1 = pupilla dx     │
-    │                              Primo frame: tensor di zeri.               │
+    │ x_coarse  [1, 1, 300, 480]  full image downscaled 4× (grayscale)       │
+    │ x_fine    [2, 1, 160, 160]  full-res crops centred on the pupils        │
+    │                              idx 0 = left pupil, idx 1 = right pupil   │
+    │                              First frame: zero tensor.                  │
     └─────────────────────────────────────────────────────────────────────────┘
     ┌─ Outputs ────────────────────────────────────────────────────────────────┐
-    │ y_heatmap [1, 2, 75, 120]   posizione pupille (logit) → soft_argmax     │
-    │ y_conf    [1, 2,  1,  1]   esistenza pupille (logit) → sigmoid > thr    │
-    │ y_fine    [2, 1, 160, 160]  maschere precise (logit) → sigmoid > thr    │
+    │ y_heatmap [1, 2, 75, 120]   pupil position (logit) → soft_argmax        │
+    │ y_conf    [1, 2,  1,  1]   pupil existence (logit) → sigmoid > thr      │
+    │ y_fine    [2, 1, 160, 160]  precise masks (logit) → sigmoid > thr       │
     └──────────────────────────────────────────────────────────────────────────┘
 
-    Parametri totali: ~475K (INT8 quantized ≈ 475KB di pesi).
+    Total parameters: ~475K (INT8 quantized ≈ 475KB of weights).
 
-    Se una pupilla è assente (conf[i] < soglia):
-      - roi[i] NON viene aggiornata (tiene l'ultimo centro valido)
-      - y_fine[i] viene ignorata
-      - x_fine[i] al frame successivo = ultimo crop valido (tracking temporale)
-        oppure zeros se mai rilevata (prima occorrenza).
+    If a pupil is absent (conf[i] < threshold):
+      - roi[i] is NOT updated (keeps the last valid centre)
+      - y_fine[i] is discarded
+      - x_fine[i] for the next frame = last valid crop (temporal tracking)
+        or zeros if never detected (first occurrence).
     """
 
     def __init__(
@@ -322,17 +322,17 @@ class DualPupilNet(nn.Module):
         return y_heatmap, y_conf, y_fine
 
 
-# ── CPU utilities (non esportate su NPU) ───────────────────────────────────────
+# ── CPU utilities (not exported to NPU) ────────────────────────────────────────
 
 def soft_argmax_2d(heatmap: torch.Tensor) -> torch.Tensor:
     """
-    Soft-argmax differenziabile su heatmap 2D.
-    Più accurato dell'argmax discreto: stima subpixel della posizione del picco.
+    Differentiable soft-argmax on a 2D heatmap.
+    More accurate than discrete argmax: estimates subpixel peak position.
 
     Input : [B, C, H, W]
     Output: [B, C, 2]  — (x_norm, y_norm) ∈ [0,1]²
 
-    Esempio:
+    Example:
         centres_norm = soft_argmax_2d(y_heatmap)           # [1, 2, 2]
         centres_480  = centres_norm[0] * torch.tensor([480., 300.])  # px in 480×300
         centres_full = centres_480 * 4                     # px in 1920×1200
@@ -352,22 +352,22 @@ def soft_argmax_2d(heatmap: torch.Tensor) -> torch.Tensor:
 
 def extract_crops(
     img_full:   torch.Tensor,         # [1, 1, 1200, 1920]
-    centres:    torch.Tensor,         # [2, 2]   (cx, cy) in px 1920×1200, per pupilla L e R
-    valid:      torch.Tensor,         # [2]      bool — True se la pupilla è stata rilevata
-    prev_crops: torch.Tensor | None,  # [2, 1, crop_size, crop_size] o None (primo frame)
+    centres:    torch.Tensor,         # [2, 2]   (cx, cy) in px 1920×1200, for pupils L and R
+    valid:      torch.Tensor,         # [2]      bool — True if the pupil was detected
+    prev_crops: torch.Tensor | None,  # [2, 1, crop_size, crop_size] or None (first frame)
     crop_size:  int = 160,
 ) -> torch.Tensor:
     """
-    Ritaglia due patch dall'immagine full-res per il fine branch.
+    Crops two patches from the full-res image for the fine branch.
 
-    Per ogni pupilla i:
-      - Se valid[i]: crop centrato su centres[i] dall'immagine corrente.
-      - Se not valid[i] e prev_crops disponibile: riusa prev_crops[i]
-        (tracking temporale — la pupilla era visibile al frame precedente).
-      - Se not valid[i] e prev_crops è None: patch di zeri
-        (primo frame, pupilla mai rilevata).
+    For each pupil i:
+      - If valid[i]: crop centred on centres[i] from the current image.
+      - If not valid[i] and prev_crops available: reuse prev_crops[i]
+        (temporal tracking — the pupil was visible in the previous frame).
+      - If not valid[i] and prev_crops is None: zero patch
+        (first frame, pupil never detected).
 
-    I bordi vengono gestiti con padding reflect (caso raro, non ottimizzato).
+    Borders are handled with reflect padding (rare case, not optimised).
 
     Output: [2, 1, crop_size, crop_size]
     """
@@ -401,7 +401,7 @@ def extract_crops(
 
 
 def make_gaussian_heatmap(
-    centre: tuple,    # (cx, cy) in pixel nel 1920×1200
+    centre: tuple,    # (cx, cy) in pixels in 1920×1200
     out_h: int = 75,
     out_w: int = 120,
     full_h: int = 1200,
@@ -409,12 +409,12 @@ def make_gaussian_heatmap(
     sigma: float = 2.0,
 ) -> torch.Tensor:
     """
-    Genera un heatmap gaussiano 2D per il training del CoarseBranch.
+    Generates a 2D Gaussian heatmap for CoarseBranch training.
 
-    Il centro viene proiettato da coordinate 1920×1200 a out_h×out_w
-    (divisione per il fattore di scala = full_h/out_h = 16).
+    The centre is projected from 1920×1200 coordinates to out_h×out_w
+    (divided by the scale factor = full_h/out_h = 16).
 
-    Output: [out_h, out_w] — valori in [0,1]
+    Output: [out_h, out_w] — values in [0,1]
     """
     scale_y = full_h / out_h
     scale_x = full_w / out_w
