@@ -1,4 +1,5 @@
 from datetime import datetime
+import os
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
@@ -66,11 +67,11 @@ dataset_name   = 'dual'
 dataset_height = 300
 dataset_width  = 480
 dataset_depth  = 8
-model_name     = 'hal'   # see model selection table above
+model_name     = os.environ.get('VALKYRIE_MODEL',   'hal')   # see model selection table above
 
-batch_size     = 8    # 8 on local GPU / 16 on Colab T4 — HalfUNet is VRAM-light
-num_epochs     = 100  # let early stopping decide the actual stopping point
-patience       = 10   # epochs without improvement before stopping
+batch_size     = int(os.environ.get('VALKYRIE_BATCH',   '8'))    # 8 on local GPU / 16 on Colab T4
+num_epochs     = int(os.environ.get('VALKYRIE_EPOCHS',  '100'))  # let early stopping decide
+patience       = int(os.environ.get('VALKYRIE_PATIENCE','10'))    # epochs without improvement
 
 # Prepare tensorboard writer
 writer = SummaryWriter()
@@ -88,8 +89,13 @@ transform = transforms.Compose([
 train_dataset, val_dataset = get_train_val_datasets(image_dir, mask_dir, transform)
 
 # DataLoader for training and validation
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+# num_workers=2: data loading runs in parallel with GPU compute (major speedup)
+# pin_memory=True: faster CPU→GPU transfer when CUDA is available
+_num_workers = 2 if torch.cuda.is_available() else 0
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                          num_workers=_num_workers, pin_memory=torch.cuda.is_available())
+val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                          num_workers=_num_workers, pin_memory=torch.cuda.is_available())
 
 # Show sample data on tensorboard
 dataiter = iter(train_loader)

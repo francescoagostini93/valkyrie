@@ -7,7 +7,10 @@ class PupilDataset(Dataset):
         self.image_dir = image_dir
         self.mask_dir = mask_dir
         self.transform = transform
-        self.images = os.listdir(image_dir)
+        self.images = sorted([
+            f for f in os.listdir(image_dir)
+            if os.path.exists(os.path.join(mask_dir, f))
+        ])
 
     def __len__(self):
         return len(self.images)
