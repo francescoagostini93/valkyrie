@@ -73,7 +73,7 @@ import numpy as np
 # ──────────────────────────────────────────────────────────────────────────────
 
 dataset_name   = 'dual'
-dataset_height = 140
+dataset_height = 150
 dataset_width  = 240
 dataset_depth  = 8
 model_name     = os.environ.get('VALKYRIE_MODEL',   'mini_hal')   # see model selection table above
@@ -98,9 +98,11 @@ transform = transforms.Compose([
 train_dataset, val_dataset = get_train_val_datasets(image_dir, mask_dir, transform)
 
 # DataLoader for training and validation
-# num_workers=2: data loading runs in parallel with GPU compute (major speedup)
-# pin_memory=True: faster CPU→GPU transfer when CUDA is available
-_num_workers = 2 if torch.cuda.is_available() else 0
+# num_workers: on Windows, multiprocessing uses "spawn" which re-executes the
+# entire script in each worker — crashing unless the script is guarded by
+# `if __name__ == '__main__':`. Force 0 on Windows to avoid this.
+# On Linux/macOS "fork" is used, so workers > 0 are safe.
+_num_workers = 0 if os.name == 'nt' else (2 if torch.cuda.is_available() else 0)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                           num_workers=_num_workers, pin_memory=torch.cuda.is_available())
 val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,

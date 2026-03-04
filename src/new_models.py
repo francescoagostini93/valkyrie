@@ -241,7 +241,7 @@ class MiniHalfUNet(nn.Module):
         out_channels: int = 1,
         features: int = 32,
         num_levels: int = 4,
-        img_h: int = 140,
+        img_h: int = 150,
         img_w: int = 240,
     ):
         super().__init__()
