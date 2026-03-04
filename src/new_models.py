@@ -198,6 +198,96 @@ class HalfUNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MiniHalfUNet — NPU-optimised lightweight variant
+# ---------------------------------------------------------------------------
+
+class MiniHalfUNet(nn.Module):
+    """
+    MiniHalfUNet — compact, NPU-optimised variant of HalfUNet for RK3566.
+
+    Differences from HalfUNet:
+      - Default features=32  (vs 64) — halves channel width throughout the network.
+      - Default num_levels=4         — bottleneck at ~17×30 for 140×240 input.
+      - Hardcoded target resolution (img_h, img_w) stored at init time.
+        The full-scale fusion uses  F.interpolate(..., size=(img_h, img_w))
+        with Python-integer constants, NOT tensor.shape[2:].
+        This guarantees that the exported ONNX graph contains no Shape/Slice
+        nodes, so all Resize ops are assigned to the NPU without CPU fallback.
+      - mode='nearest' in all Resize nodes — the only mode accelerated on NPU
+        driver 0.9.8 for scale factors > 2×.
+
+    NPU performance target (RK3566, INT8, 140×240):
+        ~25–50 ms / 20–40 FPS  (vs 203 ms for HalfUNet at 300×480).
+
+    Training note:
+        Prepare the dataset at 240×140 px (width×height).
+        The ground-truth masks must also be at 140×240 — the model output
+        resolution equals the input resolution, so no post-processing resize
+        is needed during training.
+
+    Parameters
+    ----------
+    in_channels  : int  — input channels (1 for grayscale)
+    out_channels : int  — output channels (1 for binary mask)
+    features     : int  — uniform channel count across all encoder levels (default 32)
+    num_levels   : int  — encoder depth (default 4 → bottleneck at ~17×30 for 140×240)
+    img_h        : int  — input height in pixels (default 140)
+    img_w        : int  — input width  in pixels (default 240)
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        features: int = 32,
+        num_levels: int = 4,
+        img_h: int = 140,
+        img_w: int = 240,
+    ):
+        super().__init__()
+        self.num_levels = num_levels
+        self.img_h = img_h
+        self.img_w = img_w
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Encoder: num_levels stages, all with `features` channels
+        self.encoders = nn.ModuleList()
+        for i in range(num_levels):
+            in_ch = in_channels if i == 0 else features
+            self.encoders.append(DoubleGhostConv(in_ch, features))
+
+        # Decoder: single conv block after full-scale fusion
+        self.decoder_conv = DoubleGhostConv(features, features)
+
+        # Final 1×1 classifier
+        self.final_conv = nn.Conv2d(features, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encoder pass
+        encoder_outs = []
+        for i, encoder in enumerate(self.encoders):
+            if i > 0:
+                x = self.pool(x)
+            x = encoder(x)
+            encoder_outs.append(x)
+
+        # Full-scale feature fusion with NPU-friendly constants:
+        #   size=(self.img_h, self.img_w) are Python ints → constant in ONNX,
+        #   no Shape/Slice nodes generated → all Resize ops stay on NPU.
+        fused = encoder_outs[0]
+        for i in range(1, self.num_levels):
+            up = F.interpolate(
+                encoder_outs[i],
+                size=(self.img_h, self.img_w),
+                mode='nearest',
+            )
+            fused = fused + up
+
+        out = self.decoder_conv(fused)
+        return self.final_conv(out)
+
+
+# ---------------------------------------------------------------------------
 # Standard UNet
 # ---------------------------------------------------------------------------
 

@@ -4,7 +4,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from model import SimpleUNET
-from new_models import HalfUNet, UNet, AttentionUNet
+from new_models import HalfUNet, MiniHalfUNet, UNet, AttentionUNet
 from loss import DiceLoss
 from dataset import get_train_val_datasets
 import torchvision
@@ -60,14 +60,23 @@ import numpy as np
 #                                                         no decoder memory overhead.
 #                                                         Fastest; recommended for
 #                                                         embedded (RKNN/NPU) deployment.
+#
+#   'mini_hal' MiniHalfUNet    new_models.py    ~0.05 M  NPU-optimised variant of hal:
+#                                                         32 channels (vs 64), 4 encoder
+#                                                         levels, input 140×240.
+#                                                         Resize uses hardcoded constant
+#                                                         sizes + nearest-neighbor mode
+#                                                         → no Shape/Slice in ONNX,
+#                                                         full NPU execution on RK3566.
+#                                                         Target: ~25-50 ms / 20-40 FPS.
 #   ─────────────────────────────────────────────────────────────────────────
 # ──────────────────────────────────────────────────────────────────────────────
 
 dataset_name   = 'dual'
-dataset_height = 300
-dataset_width  = 480
+dataset_height = 140
+dataset_width  = 240
 dataset_depth  = 8
-model_name     = os.environ.get('VALKYRIE_MODEL',   'hal')   # see model selection table above
+model_name     = os.environ.get('VALKYRIE_MODEL',   'mini_hal')   # see model selection table above
 
 batch_size     = int(os.environ.get('VALKYRIE_BATCH',   '8'))    # 8 on local GPU / 16 on Colab T4
 num_epochs     = int(os.environ.get('VALKYRIE_EPOCHS',  '100'))  # let early stopping decide
@@ -160,10 +169,13 @@ def log_predictions(model, dataloader, writer, epoch, device, num_images=4):
 
 # ── Model instantiation ───────────────────────────────────────────────────────
 _MODELS = {
-    'simple': lambda: SimpleUNET(in_channels=1, out_channels=1),
-    'unet':   lambda: UNet(in_channels=1, out_channels=1),
-    'attn':   lambda: AttentionUNet(in_channels=1, out_channels=1),
-    'hal':    lambda: HalfUNet(in_channels=1, out_channels=1, features=64, num_levels=5),
+    'simple':    lambda: SimpleUNET(in_channels=1, out_channels=1),
+    'unet':      lambda: UNet(in_channels=1, out_channels=1),
+    'attn':      lambda: AttentionUNet(in_channels=1, out_channels=1),
+    'hal':       lambda: HalfUNet(in_channels=1, out_channels=1, features=64, num_levels=5),
+    'mini_hal':  lambda: MiniHalfUNet(in_channels=1, out_channels=1,
+                                      features=32, num_levels=4,
+                                      img_h=dataset_height, img_w=dataset_width),
 }
 
 if model_name not in _MODELS:
